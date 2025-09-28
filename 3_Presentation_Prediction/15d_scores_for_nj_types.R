@@ -297,29 +297,35 @@ ggsave(paste0("figure_5i_splice_types_density_all_", current_date, ".png"), plot
 
 top_neo <- df_all_map[order(-score_average)][1:round(0.1 * .N)]
 
-# Derive sample_id from junc.id (based on diagnostics: extract after last '-', e.g., "TII" from "CPCT02010267TII")
-top_neo[, sample_id := fifelse(junc.id == "Unknown", "Unknown", sub(".*-(.*)$", "\\1", junc.id))]
+# Derive sample_id from junc.id (adjusted to extract '17233682-17233778' or similar)
+top_neo[, sample_id := fifelse(junc.id == "Unknown", "Unknown", sub("^.*:+:(.*)$", "\\1", junc.id))]
 
-# Join with patient list (safe left join; keeps all top_neo even if no match)
+# Join with patient list (safe left join)
 setkey(top_neo, sample_id)
-setkey(patient_list, sample_id)  # From your diagnostics, patient_list has "sample_id"
+setkey(patient_list, sample_id)
 top_neo_detailed <- top_neo[patient_list, nomatch = NA]
 
-# Select explicit columns for sample/neoantigen/neojunction mapping (peptide = neoantigen, junc.id = neojunction)
-top_neo_detailed <- top_neo_detailed[, .(sample_id, peptide, junc.id, hla_allele, score_average, type, fs, shared, purity)]  # Add purity from patient_list if matched
+# Add rank and cancerous (highest rank = 1; cancerous if fs or high score)
+top_neo_detailed[, rank := rank(-score_average, ties.method = "first")]
+top_neo_detailed[, cancerous := fifelse(fs == "fs" | score_average > quantile(score_average, 0.9), "High", "Low")]
 
-top_hla_summary <- top_neo_detailed[, .(count = .N, avg_score = mean(score_average, na.rm = TRUE)), by = hla_allele][order(-count)]
+# Select columns for table (peptide = sequence/neoantigen, junc.id = neojunction)
+top_neo_detailed <- top_neo_detailed[, .(hla_allele, peptide, sample_id, junc.id, score_average, rank, cancerous, type, fs, shared, purity)]
+
+# Summary by HLA (with highest score)
+top_hla_summary <- top_neo_detailed[, .(count = .N, avg_score = mean(score_average, na.rm = TRUE), highest_score = max(score_average)), by = hla_allele][order(-highest_score)]
 
 fwrite(top_neo_detailed, paste0("top_neoantigens_detailed_", current_date, ".tsv"), sep = "\t")
 fwrite(top_hla_summary, paste0("top_hla_alleles_summary_", current_date, ".tsv"), sep = "\t")
 
-p_top_hla <- ggplot(top_hla_summary, aes(x = reorder(hla_allele, -count), y = count, fill = hla_allele)) +
+# Optional plot by highest score
+p_top_hla <- ggplot(top_hla_summary, aes(x = reorder(hla_allele, -highest_score), y = highest_score, fill = hla_allele)) +
   geom_bar(stat = "identity") +
   scale_fill_manual(values = hla_colors) +
   theme_bw() +
-  labs(x = "HLA Allele", y = "Count in Top Neoantigens", title = "Top HLA Alleles in Top 10% Neoantigens")
+  labs(x = "HLA Allele", y = "Highest Score", title = "HLA Alleles by Highest Score")
 
 ggsave(paste0("figure_top_hla_distribution_", current_date, ".pdf"), width = 8, height = 6)
 ggsave(paste0("figure_top_hla_distribution_", current_date, ".png"), width = 8, height = 6)
 
-print("Step 15d completed: All joins verified, metadata added/derived—no NAs or empty files.")
+print("Step 5 completed: Table generated with HLA, sequences, sample ID, neoantigen, scores, rank, and cancerous flag.")
