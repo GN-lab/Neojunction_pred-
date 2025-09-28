@@ -3,10 +3,10 @@
 Neojunction prediction from 307 transcriptomic dataset acquired from Hartwig (Breast sample)
 
 ## 1. Neojunction calling
-The characterization of neojunctions is first performed by evaluating splice sites in tumor samples derived from TCGA and filtering against splice sites with putative read expression in a normal tissue repository, GTEx (n=9166).
+The characterization of neojunctions is first performed by evaluating splice sites in breat metastatic rna samples derived from Hartwig and filtering against splice sites with putative read expression in a normal tissue repository, GTEx (n=9166).
 
 ### Step 01. Tumor purity
-From meta data files, remove samples with a tumor purity of lower than 60%. Various TCGA publications will include meta data quantifying tumor purity. For our studies, we have used Kahles et al. 2018 (Cancer Cell).
+From meta data files, remove samples with a tumor purity of lower than 60%. 
 
 ### Step 02. Protein-coding genes
 Identify and filter for protein-coding genes with a corresponding GTF file (Homo_sapiens.GRCh37.87.chr.gtf in our study). This will generate a dataframe of protein-encoding genes and their respectie coordinates.
@@ -23,19 +23,6 @@ Filter out annotated splicing junctions in the corresponding GTF file (sjdbList.
 ### Step 06. Prepare splicing junction overlap table
 
 
-**Goal** (Summary)
-
-- Start with STAR sj.out.tab files.
-- Remove junctions annotated in GENCODE(GRch38).
-- Keep only junctions overlapping non-mitochondrial, protein-coding genes.
-- Remove junctions with <10 spliced reads (per sample) or <20 total reads (cohort).
-- Compute spliced frequency:
-- Frequency = total target spliced reads / (target + canonical spliced reads).
-- Retain junctions with frequency >1%.
-- Define “public” junctions:
-- Expressed in ≥10% of cohort, with above criteria.
-- Remove junctions found in >1% of GTEx normal samples.
-- Output: high-confidence, cancer-specific, non-annotated junctions.
 
 **STAR aligner** 
 
