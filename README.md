@@ -73,3 +73,14 @@ Specifies the minimum allowed intron length (20 bases) for splice junctions. Ver
 --alignIntronMax 1000000
 Sets the maximum allowed intron length (1,000,000 bases). This limits extremely long introns that could be biologically implausible or mapping artifacts.
 
+<img width="2400" height="1800" alt="figure_5i_fs_if_boxplot_20250928" src="https://github.com/user-attachments/assets/afada8f3-e0b4-4ad9-8843-6276ad1510eb" />
+
+<img width="3000" height="1800" alt="figure_5i_splice_types_jitter_20250928" src="https://github.com/user-attachments/assets/cdb3c880-395a-4753-9251-12ddf68b5f1f" />
+
+<img width="2400" height="1500" alt="figure_5i_fs_if_density_all_20250928" src="https://github.com/user-attachments/assets/1b15fbf6-babc-4fb4-bcd7-caaca6ac60d3" />
+
+<img width="2400" height="3000" alt="figure_5i_splice_types_density_all_20250928" src="https://github.com/user-attachments/assets/73be694c-fd42-4bdf-89d6-a7c3983c3f9f" />
+
+<img width="2400" height="1800" alt="figure_5i_fs_if_jitter_20250928" src="https://github.com/user-attachments/assets/40a758b0-f2d4-464c-b5f4-51e530a5b98b" />
+
+
