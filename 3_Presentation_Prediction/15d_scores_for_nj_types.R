@@ -33,99 +33,131 @@ directory_15 <- Sys.getenv("STEP15_OUTPUT_DIR", getwd())
 directory_figures <- Sys.getenv("OUTPUT_DIR", getwd())
 directory_step10 <- Sys.getenv("STEP10_OUTPUT_DIR", getwd())
 
-# Load MHCflurry output files as data.table
-mf_patterns <- c("mhcflurry_08mer_selected_alleles_20250928.tsv", 
-                 "mhcflurry_09mer_selected_alleles_20250928.tsv", 
-                 "mhcflurry_10mer_selected_alleles_20250928.tsv", 
-                 "mhcflurry_11mer_selected_alleles_20250928.tsv")
-mf_files <- paste0("results/", mf_patterns)
-df_all_map <- rbindlist(lapply(mf_files, fread), use.names = TRUE, fill = TRUE)
-
-# Load MHCflurry input files as data.table and deduplicate to avoid many-to-many
-input_patterns <- c("08mer_mhcflurry_input_2023_0812.csv", 
-                    "09mer_mhcflurry_input_2023_0812.csv", 
-                    "10mer_mhcflurry_input_2023_0812.csv", 
-                    "11mer_mhcflurry_input_2023_0812.csv")
-input_files <- paste0("results/", input_patterns)
-df_input <- rbindlist(lapply(input_files, fread), use.names = TRUE, fill = TRUE)
-df_input <- unique(df_input, by = c("peptide", "allele"))  # Deduplicate by key columns to prevent row explosion
-
-# Join with inputs using data.table merge (efficient, avoids many-to-many explosion)
-setkey(df_all_map, peptide, allele)
-setkey(df_input, peptide, allele)
-df_all_map <- df_all_map[df_input, nomatch = NA]  # Left join to keep all outputs
-
-# Load mapping for advanced metadata
-mapping_file <- "results/2023_0812_complete_list_all_mers.tsv"
-df_mapping <- fread(mapping_file)
-
-# Efficient substring matching: Batch process to reduce memory (process in chunks of 10,000 rows)
-chunk_size <- 10000
-num_chunks <- ceiling(nrow(df_all_map) / chunk_size)
-mapping_results <- list()
-
-for (chunk in 1:num_chunks) {
-  start <- (chunk - 1) * chunk_size + 1
-  end <- min(chunk * chunk_size, nrow(df_all_map))
-  chunk_pep <- df_all_map$peptide[start:end]
-  
-  # Parallel lookup for chunk
-  cl <- makeCluster(detectCores() - 1)
-  registerDoParallel(cl)
-  chunk_results <- foreach(p = chunk_pep, .combine = rbind, .packages = "stringr") %dopar% {
-    match_idx <- which(str_detect(df_mapping$`aa.seq.alt`, fixed(p)))[1]
-    if (is.na(match_idx)) {
-      data.frame(junc.id = "Unknown", type = "Unknown", fs = "Unknown")
-    } else {
-      aa_change <- df_mapping$aa.change[match_idx]
-      fs_derived <- ifelse(str_detect(aa_change, "shift|fs") | (df_mapping$ln.diff[match_idx] %% 3 != 0), "fs", "in-frame")
-      data.frame(junc.id = df_mapping$junc.id[match_idx], type = df_mapping$type[match_idx], fs = fs_derived)
-    }
-  }
-  stopCluster(cl)
-  
-  mapping_results[[chunk]] <- chunk_results
-}
-
-mapping_results <- rbindlist(mapping_results)
-
-# Bind and mutate with data.table for efficiency
-df_all_map[, c("junc.id", "type", "fs") := mapping_results]
-df_all_map[, score_average := (mhcflurry_affinity + mhcflurry_presentation_score) / 2]
-df_all_map[, shared := fifelse(mhcflurry_affinity_percentile <= 10, "Top 10%tile in MF", "Other")]
-df_all_map[, hla_allele := allele]  # Assuming consistent
-df_all_map[, type := fifelse(type == "Unknown", "OTHERS", type)]
-df_all_map[, fs := fifelse(fs == "Unknown", "in-frame", fs)]
-
-# Check match rate
-match_rate <- df_all_map[type != "OTHERS", .N] / nrow(df_all_map)
-if (match_rate < 0.5) warning(paste("Low metadata match rate:", round(match_rate * 100, 2), "%. Defaults used."))
-
-# Filter for top
-df_na_nj_map <- df_all_map[shared == "Top 10%tile in MF"]
-if (nrow(df_na_nj_map) == 0) stop("No top peptides. Adjust criteria.")
-
-# Load neojunction details
-get_latest_file <- function(dir, pattern) {
-  files <- list.files(dir, pattern = pattern, full.names = TRUE)
-  if (length(files) == 0) stop(paste("No files matching", pattern, "in", dir))
-  files[order(file.mtime(files), decreasing = TRUE)][1]
-}
-psr_neo <- fread(get_latest_file(directory_step10, "^PSR_Neojunctions_[0-9]{8}\\.tsv$"))
-count_neo <- fread(get_latest_file(directory_step10, "^Count_Table_Retained_and_Passed_Junctions_[0-9]{8}\\.tsv$"))
-
-# Join with data.table
-setkey(df_na_nj_map, junc.id)
-setkey(psr_neo, junc.id)
-setkey(count_neo, junc.id)
-df_na_nj_map <- df_na_nj_map[psr_neo][count_neo]
-
-# Load patient list (hardcoded path based on your ls output)
-patient_list_file <- "results/Patient_List_Post_TumorPurity_Filter_0.60.txt"
-if (!file.exists(patient_list_file)) stop("Patient list not found at results/Patient_List_Post_TumorPurity_Filter_0.60.txt. Adjust path.")
-patient_list <- fread(patient_list_file)
-
 current_date <- format(Sys.Date(), "%Y%m%d")
+
+# Define cache files
+CACHE_DIR <- "results/cache"
+dir.create(CACHE_DIR, showWarnings = FALSE)
+
+CACHE_ALL_MAP <- file.path(CACHE_DIR, "df_all_map_cached.rds")
+CACHE_NA_NJ_MAP <- file.path(CACHE_DIR, "df_na_nj_map_cached.rds")
+
+###########################################################################
+#  Step 0.5: Load or Compute Main Data (COMPUTATIONALLY INTENSIVE) --------
+###########################################################################
+
+if (file.exists(CACHE_ALL_MAP)) {
+  cat("Loading cached df_all_map...\n")
+  df_all_map <- readRDS(CACHE_ALL_MAP)
+} else {
+  cat("Computing df_all_map (this will take time)...\n")
+  
+  # Load MHCflurry output files as data.table
+  mf_patterns <- c("mhcflurry_08mer_selected_alleles_20250928.tsv", 
+                   "mhcflurry_09mer_selected_alleles_20250928.tsv", 
+                   "mhcflurry_10mer_selected_alleles_20250928.tsv", 
+                   "mhcflurry_11mer_selected_alleles_20250928.tsv")
+  mf_files <- paste0("results/", mf_patterns)
+  df_all_map <- rbindlist(lapply(mf_files, fread), use.names = TRUE, fill = TRUE)
+  
+  # Load MHCflurry input files as data.table and deduplicate
+  input_patterns <- c("08mer_mhcflurry_input_2023_0812.csv", 
+                      "09mer_mhcflurry_input_2023_0812.csv", 
+                      "10mer_mhcflurry_input_2023_0812.csv", 
+                      "11mer_mhcflurry_input_2023_0812.csv")
+  input_files <- paste0("results/", input_patterns)
+  df_input <- rbindlist(lapply(input_files, fread), use.names = TRUE, fill = TRUE)
+  df_input <- unique(df_input, by = c("peptide", "allele"))
+  
+  # Join with inputs
+  setkey(df_all_map, peptide, allele)
+  setkey(df_input, peptide, allele)
+  df_all_map <- df_all_map[df_input, nomatch = NA]
+  
+  # Load mapping for advanced metadata
+  mapping_file <- "results/2023_0812_complete_list_all_mers.tsv"
+  df_mapping <- fread(mapping_file)
+  
+  # Efficient substring matching
+  cat("Performing substring matching...\n")
+  chunk_size <- 10000
+  num_chunks <- ceiling(nrow(df_all_map) / chunk_size)
+  mapping_results <- list()
+  
+  for (chunk in 1:num_chunks) {
+    start <- (chunk - 1) * chunk_size + 1
+    end <- min(chunk * chunk_size, nrow(df_all_map))
+    chunk_pep <- df_all_map$peptide[start:end]
+    
+    # Parallel lookup for chunk
+    cl <- makeCluster(detectCores() - 1)
+    registerDoParallel(cl)
+    chunk_results <- foreach(p = chunk_pep, .combine = rbind, .packages = "stringr") %dopar% {
+      match_idx <- which(str_detect(df_mapping$`aa.seq.alt`, fixed(p)))[1]
+      if (is.na(match_idx)) {
+        data.frame(junc.id = "Unknown", type = "Unknown", fs = "Unknown")
+      } else {
+        aa_change <- df_mapping$aa.change[match_idx]
+        fs_derived <- ifelse(str_detect(aa_change, "shift|fs") | (df_mapping$ln.diff[match_idx] %% 3 != 0), "fs", "in-frame")
+        data.frame(junc.id = df_mapping$junc.id[match_idx], type = df_mapping$type[match_idx], fs = fs_derived)
+      }
+    }
+    stopCluster(cl)
+    
+    mapping_results[[chunk]] <- chunk_results
+    cat(sprintf("Processed chunk %d/%d\n", chunk, num_chunks))
+  }
+  
+  mapping_results <- rbindlist(mapping_results)
+  
+  # Bind and mutate with data.table for efficiency
+  df_all_map[, c("junc.id", "type", "fs") := mapping_results]
+  df_all_map[, score_average := (mhcflurry_affinity + mhcflurry_presentation_score) / 2]
+  df_all_map[, shared := fifelse(mhcflurry_affinity_percentile <= 10, "Top 10%tile in MF", "Other")]
+  df_all_map[, hla_allele := allele]
+  df_all_map[, type := fifelse(type == "Unknown", "OTHERS", type)]
+  df_all_map[, fs := fifelse(fs == "Unknown", "in-frame", fs)]
+  
+  # Save to cache
+  saveRDS(df_all_map, CACHE_ALL_MAP)
+  cat("Saved df_all_map to cache\n")
+}
+
+if (file.exists(CACHE_NA_NJ_MAP)) {
+  cat("Loading cached df_na_nj_map...\n")
+  df_na_nj_map <- readRDS(CACHE_NA_NJ_MAP)
+} else {
+  cat("Computing df_na_nj_map...\n")
+  
+  # Filter for top
+  df_na_nj_map <- df_all_map[shared == "Top 10%tile in MF"]
+  if (nrow(df_na_nj_map) == 0) stop("No top peptides. Adjust criteria.")
+  
+  # Load neojunction details
+  get_latest_file <- function(dir, pattern) {
+    files <- list.files(dir, pattern = pattern, full.names = TRUE)
+    if (length(files) == 0) stop(paste("No files matching", pattern, "in", dir))
+    files[order(file.mtime(files), decreasing = TRUE)][1]
+  }
+  
+  psr_neo <- fread(get_latest_file(directory_step10, "^PSR_Neojunctions_[0-9]{8}\\.tsv$"))
+  count_neo <- fread(get_latest_file(directory_step10, "^Count_Table_Retained_and_Passed_Junctions_[0-9]{8}\\.tsv$"))
+  
+  # Join with data.table
+  setkey(df_na_nj_map, junc.id)
+  setkey(psr_neo, junc.id)
+  setkey(count_neo, junc.id)
+  df_na_nj_map <- df_na_nj_map[psr_neo][count_neo]
+  
+  # Save to cache
+  saveRDS(df_na_nj_map, CACHE_NA_NJ_MAP)
+  cat("Saved df_na_nj_map to cache\n")
+}
+
+# Load patient list (this is quick)
+patient_list_file <- "results/Patient_List_Post_TumorPurity_Filter_0.60.txt"
+if (!file.exists(patient_list_file)) stop("Patient list not found.")
+patient_list <- fread(patient_list_file)
 
 ###########################################################################
 #  Step 1. Plot FS NJ's neoantigen scores for the top neoantigens ---------
@@ -292,40 +324,157 @@ ggsave(paste0("figure_5i_splice_types_density_all_", current_date, ".pdf"), plot
 ggsave(paste0("figure_5i_splice_types_density_all_", current_date, ".png"), plot = p_arranged, width = 8, height = 10)
 
 ###########################################################################
-#  Step 5. Identify Top HLA Alleles and Neoantigens -----------------------
+#  Step 5. Identify Top HLA Alleles and Neoantigens (MATRIX FORMAT) -------
 ###########################################################################
 
+# Load cached data
+cat("Loading cached data...\n")
+cache_dir <- file.path(directory_15, "cache")
+cache_all_map <- file.path(cache_dir, "df_all_map_cached.rds")
+df_all_map <- readRDS(cache_all_map)
+
+# Select top 10% by score_average
 top_neo <- df_all_map[order(-score_average)][1:round(0.1 * .N)]
+cat("Selected", nrow(top_neo), "top neoantigens\n")
 
-# Derive sample_id from junc.id (adjusted to extract '17233682-17233778' or similar)
-top_neo[, sample_id := fifelse(junc.id == "Unknown", "Unknown", sub("^.*:+:(.*)$", "\\1", junc.id))]
+# Define absolute path to Count_Neojunctions (from your pwd/ls output)
+count_neo_file <- "/home/csalas/csalas_rds/gaurav_rds/Neojuction_pred/SSNIP/results/Count_Neojunctions_20250927.tsv"
 
-# Join with patient list (safe left join)
-setkey(top_neo, sample_id)
+# Check if file exists; fallback to pattern match if not
+if (!file.exists(count_neo_file)) {
+  warning("Exact file not found. Searching for latest matching file...")
+  count_neo_pattern <- "^Count_Neojunctions_[0-9]{8}\\.tsv$"
+  count_neo_file <- get_latest_file("results", count_neo_pattern)  # Search in results/
+  if (is.null(count_neo_file) || !file.exists(count_neo_file)) {
+    stop("Count_Neojunctions file not found. Run list.files('results', pattern='Count_Neojunctions') to verify.")
+  }
+}
+count_neo <- fread(count_neo_file)
+cat("Loaded Count_Neojunctions from:", count_neo_file, "\n")
+
+# Get sample names (remove trailing dots)
+sample_names <- names(count_neo)[-1]  # Remove junc.id column
+sample_names <- sub("\\.$", "", sample_names)
+cat("Found", length(sample_names), "samples in Count_Neojunctions\n")
+
+# Create a unique neoantigen identifier
+top_neo[, neo_id := paste(peptide, junc.id, hla_allele, sep = "|")]
+
+# Initialize empty matrix: rows = neoantigens, columns = samples
+neo_matrix <- as.data.table(matrix(NA, 
+                                   nrow = nrow(top_neo), 
+                                   ncol = length(sample_names),
+                                   dimnames = list(NULL, sample_names)))
+
+# Add neoantigen metadata as first columns
+neo_matrix[, c("neo_id", "peptide", "junc.id", "hla_allele", "score_average", "type", "fs", "shared") := 
+             list(top_neo$neo_id, top_neo$peptide, top_neo$junc.id, top_neo$hla_allele, 
+                  top_neo$score_average, top_neo$type, top_neo$fs, top_neo$shared)]
+
+# Reorder columns to have metadata first, then samples
+setcolorder(neo_matrix, c("neo_id", "peptide", "junc.id", "hla_allele", "score_average", "type", "fs", "shared", sample_names))
+
+# For each junc.id in top_neo, check which samples have this junction and copy the score
+cat("Mapping scores to samples...\n")
+for(i in 1:nrow(top_neo)) {
+  current_junc <- top_neo$junc.id[i]
+  current_score <- top_neo$score_average[i]
+  
+  # Find which samples have this junction (count > 0)
+  junc_samples <- count_neo[junc.id == current_junc]
+  if(nrow(junc_samples) > 0) {
+    # Get sample names where this junction is present
+    present_samples <- names(junc_samples)[-1][as.numeric(junc_samples[1, -1]) > 0]
+    present_samples <- sub("\\.$", "", present_samples)
+    
+    # Set scores for these samples
+    for(sample in present_samples) {
+      if(sample %in% names(neo_matrix)) {
+        set(neo_matrix, i = i, j = sample, value = current_score)
+      }
+    }
+  }
+  
+  if(i %% 1000 == 0) cat("Processed", i, "/", nrow(top_neo), "neoantigens\n")
+}
+
+# Add summary statistics
+cat("Adding summary statistics...\n")
+neo_matrix[, samples_with_neo := rowSums(!is.na(.SD)), .SDcols = sample_names]
+neo_matrix[, max_sample_score := do.call(pmax, c(.SD, na.rm = TRUE)), .SDcols = sample_names]
+
+# Create sample-focused summary
+sample_summary <- data.table(
+  sample_id = sample_names,
+  total_neoantigens = colSums(!is.na(neo_matrix[, .SD, .SDcols = sample_names])),
+  max_score = sapply(sample_names, function(s) max(neo_matrix[[s]], na.rm = TRUE)),
+  avg_score = sapply(sample_names, function(s) mean(neo_matrix[[s]], na.rm = TRUE))
+)
+
+# Join with patient list for purity
+patient_list <- fread("Patient_List_Post_TumorPurity_Filter_0.60.txt")
+setkey(sample_summary, sample_id)
 setkey(patient_list, sample_id)
-top_neo_detailed <- top_neo[patient_list, nomatch = NA]
+sample_summary <- sample_summary[patient_list, nomatch = 0]
 
-# Add rank and cancerous (highest rank = 1; cancerous if fs or high score)
-top_neo_detailed[, rank := rank(-score_average, ties.method = "first")]
-top_neo_detailed[, cancerous := fifelse(fs == "fs" | score_average > quantile(score_average, 0.9), "High", "Low")]
+# Create HLA summary
+hla_summary <- top_neo[, .(
+  count_neoantigens = .N,
+  avg_score = mean(score_average),
+  max_score = max(score_average),
+  unique_junctions = uniqueN(junc.id),
+  fs_count = sum(fs == "fs"),
+  in_frame_count = sum(fs == "in-frame")
+), by = hla_allele][order(-max_score)]
 
-# Select columns for table (peptide = sequence/neoantigen, junc.id = neojunction)
-top_neo_detailed <- top_neo_detailed[, .(hla_allele, peptide, sample_id, junc.id, score_average, rank, cancerous, type, fs, shared, purity)]
+# Write outputs
+cat("Writing output files...\n")
 
-# Summary by HLA (with highest score)
-top_hla_summary <- top_neo_detailed[, .(count = .N, avg_score = mean(score_average, na.rm = TRUE), highest_score = max(score_average)), by = hla_allele][order(-highest_score)]
+# 1. Main neoantigen matrix (wide format)
+fwrite(neo_matrix, paste0("top_neoantigens_matrix_", current_date, ".tsv"), sep = "\t")
 
-fwrite(top_neo_detailed, paste0("top_neoantigens_detailed_", current_date, ".tsv"), sep = "\t")
-fwrite(top_hla_summary, paste0("top_hla_alleles_summary_", current_date, ".tsv"), sep = "\t")
+# 2. Sample summary
+fwrite(sample_summary, paste0("sample_neoantigen_summary_", current_date, ".tsv"), sep = "\t")
 
-# Optional plot by highest score
-p_top_hla <- ggplot(top_hla_summary, aes(x = reorder(hla_allele, -highest_score), y = highest_score, fill = hla_allele)) +
+# 3. HLA summary  
+fwrite(hla_summary, paste0("hla_alleles_summary_", current_date, ".tsv"), sep = "\t")
+
+# 4. Long format for specific analyses
+neo_long <- melt(neo_matrix, 
+                 id.vars = c("neo_id", "peptide", "junc.id", "hla_allele", "score_average", "type", "fs", "shared"),
+                 variable.name = "sample_id", 
+                 value.name = "sample_score",
+                 measure.vars = sample_names)
+neo_long <- neo_long[!is.na(sample_score)]
+fwrite(neo_long, paste0("top_neoantigens_long_", current_date, ".tsv"), sep = "\t")
+
+# Create visualization
+p_top_hla <- ggplot(hla_summary, aes(x = reorder(hla_allele, -max_score), y = max_score, fill = hla_allele)) +
   geom_bar(stat = "identity") +
   scale_fill_manual(values = hla_colors) +
   theme_bw() +
-  labs(x = "HLA Allele", y = "Highest Score", title = "HLA Alleles by Highest Score")
+  labs(x = "HLA Allele", y = "Highest Score", title = "HLA Alleles by Highest Neoantigen Score") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
 ggsave(paste0("figure_top_hla_distribution_", current_date, ".pdf"), width = 8, height = 6)
 ggsave(paste0("figure_top_hla_distribution_", current_date, ".png"), width = 8, height = 6)
 
-print("Step 5 completed: Table generated with HLA, sequences, sample ID, neoantigen, scores, rank, and cancerous flag.")
+# Sample-level visualization
+p_sample_neo <- ggplot(sample_summary, aes(x = reorder(sample_id, -total_neoantigens), y = total_neoantigens, fill = purity)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_c() +
+  theme_bw() +
+  labs(x = "Sample", y = "Number of Top Neoantigens", title = "Top Neoantigens per Sample") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6))
+
+ggsave(paste0("figure_sample_neoantigens_", current_date, ".pdf"), width = 12, height = 6)
+ggsave(paste0("figure_sample_neoantigens_", current_date, ".png"), width = 12, height = 6)
+
+cat("Step 5 completed successfully!\n")
+cat("Generated files:\n")
+cat("1. top_neoantigens_matrix_", current_date, ".tsv - Main matrix format\n")
+cat("2. sample_neoantigen_summary_", current_date, ".tsv - Sample-level summary\n")  
+cat("3. hla_alleles_summary_", current_date, ".tsv - HLA-level summary\n")
+cat("4. top_neoantigens_long_", current_date, ".tsv - Long format for analysis\n")
+
+print("All tasks completed successfully.")
