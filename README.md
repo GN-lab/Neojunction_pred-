@@ -77,6 +77,7 @@ Required inputs:
 
 ```text
 samples.txt
+mapped_sample_purity.txt
 FASTQ files
 Reference genome
 GTF annotation
