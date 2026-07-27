@@ -1,7 +1,6 @@
 sample_id	purity
-KURA_VC1	1.0
-KURA_VC2	1.0
-KURA_VC3	1.0
-KURA_INDI1	1.0
-KURA_INDI2	1.0
-KURA_INDI3	1.0
+Sample-1	1.0
+Sample-2	1.0
+Sample-3	1.0
+Sample-4	1.0
+Sample-5	1.0
