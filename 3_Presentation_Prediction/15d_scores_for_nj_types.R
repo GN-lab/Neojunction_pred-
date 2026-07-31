@@ -109,18 +109,23 @@ cat(sprintf("[INFO] ALT Tier 1 rows after low-complexity filter: %d\n", nrow(alt
 cat(sprintf("[INFO] ALT Tier 1 unique peptides:   %d\n", uniqueN(alt_t1$peptide)))
 cat(sprintf("[INFO] ALT Tier 1 unique junctions:  %d\n", uniqueN(alt_t1$junc.id)))
 
-# WT map (optional)
-wt_map_file <- file.path(directory_15,
-                          paste0("wt_neoA_to_neoJ_map_", date_15c, ".tsv"))
-wt_t1 <- if (file.exists(wt_map_file)) {
-  dt <- fread(wt_map_file, na.strings = c("", "NA"), quote = "")
+# Native WT candidates are not neojunctions and must never be loaded from
+# wt_neoA_to_neoJ_map. Step 15c preserves them without NJ mapping.
+wt_scan <- list.files(directory_15,
+                      pattern = "^wt_native_tier1_[0-9]{8}\\.tsv$")
+wt_t1 <- if (length(wt_scan) > 0) {
+  wt_file <- wt_scan[which.max(
+    file.info(file.path(directory_15, wt_scan))$mtime)]
+  dt <- fread(file.path(directory_15, wt_file),
+              na.strings = c("", "NA"), quote = "")
   dt[, concordance_tier := gsub('^"|"$', "", concordance_tier)]
   dt[concordance_tier == "Tier1_HighConfidence"]
 } else {
-  cat("[WARN] WT map file not found -- skipping WT bed\n")
+  cat("[WARN] wt_native_tier1 file not found -- skipping WT bed\n")
   data.table()
 }
-cat(sprintf("[INFO] WT Tier 1 rows: %d\n", nrow(wt_t1)))
+cat(sprintf("[INFO] Native WT Tier 1 rows: %d | %d peptides\n",
+            nrow(wt_t1), uniqueN(wt_t1$peptide)))
 
 ###########################################################################
 #  Step 3: Generate bed files
@@ -207,49 +212,35 @@ if (length(coord_files_exist) == 0) {
     paste0("immunogenic_peptides_", current_date, ".bed")
   )
 
-  # WT Tier 1 bed -- native immunopeptidome reference
-  # The coordinate map only contains ALT peptides so we cannot use make_bed.
-  # Instead: load complete_list_all_mers to get aa.seq.wt and enst.model,
-  # then find each WT peptide's position within aa.seq.wt to get AA coords.
+  # WT Tier 1 bed -- native expressed-transcript immunopeptidome reference.
+  # These coordinates are emitted by Step 11b before peptide deduplication.
+  # Never use complete_list_all_mers here: it contains only NJ-associated
+  # transcripts and silently restricts the native reference to that subset.
   if (nrow(wt_t1) > 0) {
-    cat("[INFO] Building WT bed from aa.seq.wt in complete_list_all_mers...\n")
+    wt_coord_files <- file.path(output_dir, paste0(
+      "2023_0812_wt_peptide_coordinate_map_",
+      c("08", "09", "10", "11"), "mers.tsv"
+    ))
+    wt_coord_files <- wt_coord_files[file.exists(wt_coord_files)]
 
-    mers_file <- file.path(output_dir, "2023_0812_complete_list_all_mers.tsv")
-    if (!file.exists(mers_file)) {
-      warning("[WARN] complete_list_all_mers.tsv not found -- skipping WT bed")
+    if (length(wt_coord_files) == 0) {
+      warning(paste0(
+        "[WARN] No WT peptide coordinate maps found -- skipping WT bed. ",
+        "Rerun Step 11b to generate them."
+      ))
     } else {
-      mers_wt <- fread(mers_file, na.strings = c("", "NA"), quote = "",
-                       select = c("junc.id", "enst.model", "aa.seq.wt"))
-      mers_wt <- mers_wt[!is.na(aa.seq.wt) & nchar(aa.seq.wt) > 0]
-      # Keep longest aa.seq.wt per junc.id
-      mers_wt[, seq_len := nchar(aa.seq.wt)]
-      setorder(mers_wt, junc.id, -seq_len)
-      mers_wt <- mers_wt[, .SD[1], by = junc.id]
+      wt_coord <- rbindlist(lapply(wt_coord_files, fread),
+                            use.names = TRUE, fill = TRUE)
+      cat(sprintf("[INFO] WT coordinate map: %d rows | %d transcripts\n",
+                  nrow(wt_coord), uniqueN(wt_coord$enst.model)))
 
-      # For each unique WT peptide x junction, find position in aa.seq.wt
-      wt_unique <- unique(wt_t1[, .(peptide, junc.id, allele)])
-      wt_joined <- merge(wt_unique, mers_wt, by = "junc.id",
+      wt_unique <- unique(wt_t1[, .(peptide, allele)])
+      wt_joined <- merge(wt_unique, wt_coord, by = "peptide",
                          all.x = TRUE, allow.cartesian = TRUE)
-      wt_joined <- wt_joined[!is.na(aa.seq.wt)]
-
-      # Find AA start position of each peptide within its corresponding wt sequence.
-      # Use vectorised stringr::str_locate for speed and correctness.
-      # Works row-by-row: each peptide is searched in its own aa.seq.wt.
-      wt_joined[, aa_start := {
-        peps <- as.character(peptide)
-        seqs <- as.character(aa.seq.wt)
-        pos  <- integer(length(peps))
-        for (i in seq_along(peps)) {
-          p <- regexpr(peps[i], seqs[i], fixed = TRUE)
-          pos[i] <- if (p > 0L) as.integer(p) else NA_integer_
-        }
-        pos
-      }]
-      wt_joined <- wt_joined[!is.na(aa_start)]
-      wt_joined[, aa_end := aa_start + nchar(peptide) - 1L]
+      wt_joined <- wt_joined[!is.na(enst.model)]
 
       if (nrow(wt_joined) == 0) {
-        warning("[WARN] No WT peptides found in aa.seq.wt -- skipping WT bed")
+        warning("[WARN] No WT Tier 1 peptides matched the WT coordinate map")
       } else {
         # Collapse alleles per transcript + position + peptide
         wt_bed <- wt_joined[, .(
