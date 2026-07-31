@@ -187,8 +187,11 @@ assign_tiers <- function(dt) {
 
 join_tools <- function(nmp_dt, mhc_dt) {
   # Best row per allele+peptide in each tool
-  nmp_best <- nmp_dt[order(netmhcpan_EL_rank)][, .SD[1], by = .(allele, peptide)]
-  mhc_best <- mhc_dt[order(mhcflurry_affinity)][, .SD[1], by = .(allele, peptide)]
+  # setorder() + unique() avoids the very large .SD allocation made by .SD[1].
+  setorder(nmp_dt, netmhcpan_EL_rank, na.last = TRUE)
+  setorder(mhc_dt, mhcflurry_affinity, na.last = TRUE)
+  nmp_best <- unique(nmp_dt, by = c("allele", "peptide"))
+  mhc_best <- unique(mhc_dt, by = c("allele", "peptide"))
   merge(nmp_best, mhc_best, by = c("allele", "peptide"), all = TRUE)
 }
 
@@ -230,23 +233,33 @@ write_tiers <- function(dt, prefix) {
 #  This is done BEFORE any ALT processing.
 ###########################################################################
 
-cat("\n========== STEP 1: Building WT exclusion set ==========\n")
+cat("\n========== STEP 1: Building WT exclusion set (by length) ==========\n")
 
-cat("[INFO] Loading NetMHCpan WT (all levels)...\n")
-nmp_wt_all <- rbindlist(
-  lapply(c("08","09","10","11"), load_nmp_raw, type = "wt"), fill = TRUE)
-cat(sprintf("[INFO] NetMHCpan WT total rows: %d\n", nrow(nmp_wt_all)))
-
-cat("[INFO] Loading MHCflurry WT (all levels)...\n")
-mhc_wt_all <- rbindlist(
-  lapply(c("08","09","10","11"), load_mhc_raw, type = "wt"), fill = TRUE)
-cat(sprintf("[INFO] MHCflurry WT total rows: %d\n", nrow(mhc_wt_all)))
-
-# Union of ALL WT peptide sequences from both tools
-wt_exclusion <- unique(c(
-  unique(nmp_wt_all$peptide),
-  unique(mhc_wt_all$peptide)
-))
+# Never retain the 345M-row WT prediction tables.  Only the unique peptide
+# vectors are kept here; the full data are re-read one length at a time in 2b.
+wt_exclusion_parts <- vector("list", 4L)
+lengths <- c("08", "09", "10", "11")
+for (i in seq_along(lengths)) {
+  len <- lengths[i]
+  cat(sprintf("[INFO] Collecting unique WT peptides for %smer...\n", len))
+  nmp_file <- file.path(directory_13,
+                        paste0("netmhcpan_", len, "mer_wt_", nmp_run_date, ".tsv"))
+  mhc_file <- file.path(directory_14,
+                        paste0(len, "mers_flank_mhcflurry_wt_", mhc_wt_date, ".csv"))
+  # Step 1 needs no scores: reading one column instead of fourteen materially
+  # reduces both resident memory and I/O.
+  nmp_peptides <- fread(nmp_file, select = "peptide", na.strings = c("", "NA"))
+  mhc_peptides <- fread(mhc_file, select = "peptide", na.strings = c("", "NA"))
+  wt_exclusion_parts[[i]] <- unique(c(nmp_peptides$peptide, mhc_peptides$peptide))
+  cat(sprintf("[INFO]   %smer rows: NMP=%d, MHC=%d; unique peptides=%d\n",
+              len, nrow(nmp_peptides), nrow(mhc_peptides),
+              length(wt_exclusion_parts[[i]])))
+  rm(nmp_peptides, mhc_peptides)
+  gc(verbose = FALSE)
+}
+wt_exclusion <- unique(unlist(wt_exclusion_parts, use.names = FALSE))
+rm(wt_exclusion_parts)
+gc(verbose = FALSE)
 cat(sprintf("\n[INFO] Total unique WT peptides to exclude: %d\n", length(wt_exclusion)))
 
 # Write exclusion list for traceability
@@ -261,64 +274,71 @@ cat(sprintf("[INFO] WT exclusion list written: wt_exclusion_peptides_%s.txt\n",
 #  Load ALL ALT predictions, remove WT peptides, then tier what remains.
 ###########################################################################
 
-cat("\n========== STEP 2a: Clean ALT immunopeptidome ==========\n")
+cat("\n========== STEP 2a: Clean ALT immunopeptidome (by length) ==========\n")
 
-cat("[INFO] Loading NetMHCpan ALT (all levels)...\n")
-nmp_alt_all <- rbindlist(
-  lapply(c("08","09","10","11"), load_nmp_raw, type = "alt"), fill = TRUE)
-cat(sprintf("[INFO] NetMHCpan ALT total rows: %d\n", nrow(nmp_alt_all)))
+# Process and write one peptide length at a time.  Excluded rows are counted
+# but never accumulated: downstream scripts only consume retained tiers.
+process_in_chunks <- function(type, apply_wt_exclusion = FALSE) {
+  prefix <- paste0(type, "_concordance")
+  paths <- c(
+    tier1 = file.path(directory_15, paste0(prefix, "_tier1_", current_date, ".tsv")),
+    tier2 = file.path(directory_15, paste0(prefix, "_tier2_", current_date, ".tsv")),
+    tier3 = file.path(directory_15, paste0(prefix, "_tier3_", current_date, ".tsv")),
+    all   = file.path(directory_15, paste0(prefix, "_all_",   current_date, ".tsv"))
+  )
+  unlink(paths)
+  counts <- setNames(integer(4), c("Tier1_HighConfidence",
+                                   "Tier2_MediumConfidence",
+                                   "Tier3_Discordant_NMPstrong",
+                                   "Tier3_Discordant_MHCstrong"))
+  excluded <- 0L
+  for (len in lengths) {
+    cat(sprintf("\n[INFO] Processing %s %smer chunk...\n", toupper(type), len))
+    nmp <- load_nmp_raw(len, type)
+    mhc <- load_mhc_raw(len, type)
+    if (apply_wt_exclusion) {
+      nmp <- nmp[!peptide %chin% wt_exclusion]
+      mhc <- mhc[!peptide %chin% wt_exclusion]
+    }
+    tiered <- assign_tiers(join_tools(nmp, mhc))
+    tab <- tiered[, .N, by = concordance_tier]
+    excluded <- excluded + tab[concordance_tier == "Excluded", sum(N)]
+    for (nm in names(counts)) counts[nm] <- counts[nm] + tab[concordance_tier == nm, sum(N)]
 
-cat("[INFO] Loading MHCflurry ALT (all levels)...\n")
-mhc_alt_all <- rbindlist(
-  lapply(c("08","09","10","11"), load_mhc_raw, type = "alt"), fill = TRUE)
-cat(sprintf("[INFO] MHCflurry ALT total rows: %d\n", nrow(mhc_alt_all)))
+    retained <- tiered[concordance_tier != "Excluded"]
+    pieces <- list(
+      tier1 = retained[concordance_tier == "Tier1_HighConfidence"],
+      tier2 = retained[concordance_tier == "Tier2_MediumConfidence"],
+      tier3 = retained[grepl("Tier3", concordance_tier)],
+      all = retained
+    )
+    for (nm in names(paths)) {
+      if (nrow(pieces[[nm]]) > 0L)
+        fwrite(pieces[[nm]], paths[[nm]], sep = "\t", na = "NA",
+               append = file.exists(paths[[nm]]), col.names = !file.exists(paths[[nm]]))
+    }
+    cat(sprintf("[INFO]   retained=%d, excluded=%d\n", nrow(retained),
+                tab[concordance_tier == "Excluded", sum(N)]))
+    rm(nmp, mhc, tiered, retained, pieces, tab)
+    gc(verbose = FALSE)
+  }
+  list(counts = counts, excluded = excluded, paths = paths)
+}
 
-# Apply WT exclusion filter FIRST -- before any tiering
-nmp_alt_clean <- nmp_alt_all[!peptide %in% wt_exclusion]
-mhc_alt_clean <- mhc_alt_all[!peptide %in% wt_exclusion]
+alt_results <- process_in_chunks("alt", apply_wt_exclusion = TRUE)
 
-cat(sprintf("\n[INFO] NMP ALT after WT exclusion: %d rows (removed %d)\n",
-            nrow(nmp_alt_clean), nrow(nmp_alt_all) - nrow(nmp_alt_clean)))
-cat(sprintf("[INFO] MHC ALT after WT exclusion: %d rows (removed %d)\n",
-            nrow(mhc_alt_clean), nrow(mhc_alt_all) - nrow(mhc_alt_clean)))
-
-# Now join and tier the clean ALT set
-cat("\n[INFO] Joining clean ALT NMP + MHCflurry...\n")
-alt_joined <- join_tools(nmp_alt_clean, mhc_alt_clean)
-cat(sprintf("[INFO] Clean ALT combined rows: %d\n", nrow(alt_joined)))
-
-alt_tiered <- assign_tiers(alt_joined)
-
-cat("\n--- ALT concordance counts ---\n")
-print(alt_tiered[, .N, by = concordance_tier][order(-N)])
-
-cat("\n[INFO] Writing ALT tier files...\n")
-alt_results <- write_tiers(alt_tiered, "alt_concordance")
-
-# Write full joined table for downstream 15b/c/d compatibility
-setwd(directory_15)
-fwrite(alt_tiered[concordance_tier != "Excluded"],
-       paste0("cross_alg_all_nmers_", current_date, ".tsv"),
-       sep="\t", na="NA")
+# Exact compatibility alias used by downstream 15b/c/d.
+file.copy(alt_results$paths[["all"]],
+          file.path(directory_15, paste0("cross_alg_all_nmers_", current_date, ".tsv")),
+          overwrite = TRUE)
 
 ###########################################################################
 #  ======================== STEP 2b: WT NATIVE IMMUNOPEPTIDOME ===========
 #  Tier the WT predictions independently as a reference set.
 ###########################################################################
 
-cat("\n========== STEP 2b: WT native immunopeptidome ==========\n")
-
-cat("\n[INFO] Joining WT NMP + MHCflurry...\n")
-wt_joined  <- join_tools(nmp_wt_all, mhc_wt_all)
-cat(sprintf("[INFO] WT combined rows: %d\n", nrow(wt_joined)))
-
-wt_tiered  <- assign_tiers(wt_joined)
-
-cat("\n--- WT concordance counts ---\n")
-print(wt_tiered[, .N, by = concordance_tier][order(-N)])
-
-cat("\n[INFO] Writing WT tier files...\n")
-wt_results <- write_tiers(wt_tiered, "wt_concordance")
+cat("\n========== STEP 2b: WT native immunopeptidome (by length) ==========\n")
+wt_results <- process_in_chunks("wt", apply_wt_exclusion = FALSE)
 
 ###########################################################################
 #  Summary
@@ -327,16 +347,17 @@ wt_results <- write_tiers(wt_tiered, "wt_concordance")
 cat("\n=== 15a Summary ===\n")
 cat("\nALT (tumour-specific, WT-filtered):\n")
 cat(sprintf("  Tier 1 -- High confidence (NMP SB + MHC <500nM):  %d\n",
-            nrow(alt_results$tier1)))
+            alt_results$counts[["Tier1_HighConfidence"]]))
 cat(sprintf("  Tier 2 -- Medium confidence (NMP WB + MHC <500nM): %d\n",
-            nrow(alt_results$tier2)))
+            alt_results$counts[["Tier2_MediumConfidence"]]))
 cat(sprintf("  Tier 3 -- Discordant (tools disagree):             %d\n",
-            nrow(alt_results$tier3)))
+            sum(alt_results$counts[grepl("Tier3", names(alt_results$counts))])))
 
 cat("\nWT native immunopeptidome (reference):\n")
-cat(sprintf("  Tier 1 -- High confidence:   %d\n", nrow(wt_results$tier1)))
-cat(sprintf("  Tier 2 -- Medium confidence: %d\n", nrow(wt_results$tier2)))
-cat(sprintf("  Tier 3 -- Discordant:        %d\n", nrow(wt_results$tier3)))
+cat(sprintf("  Tier 1 -- High confidence:   %d\n", wt_results$counts[["Tier1_HighConfidence"]]))
+cat(sprintf("  Tier 2 -- Medium confidence: %d\n", wt_results$counts[["Tier2_MediumConfidence"]]))
+cat(sprintf("  Tier 3 -- Discordant:        %d\n",
+            sum(wt_results$counts[grepl("Tier3", names(wt_results$counts))])))
 
 cat(sprintf("\n  WT peptides excluded from ALT: %d\n", length(wt_exclusion)))
 cat(sprintf("  All files written to: %s\n", directory_15))
