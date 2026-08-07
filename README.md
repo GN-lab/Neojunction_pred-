@@ -1,5 +1,7 @@
 # JUGNU (Junction Guided Neoantigen Uncoverer)
 
+<img width="3840" height="2160" alt="JUGNU_Pipeline_Vector_EnsDb_4K" src="https://github.com/user-attachments/assets/4cba9567-be0b-4e6d-90d9-8cb36fcdf5d3" />
+
 ## Overview
 
 JUGNU (Junction-guided Neoantigen Uncoverer) is a computational pipeline for identifying tumour-specific aberrant splicing events and predicting splice-derived neoantigens from bulk RNA-sequencing data.
